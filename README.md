@@ -3,25 +3,32 @@
 NieR:Automata-styled MP3 player for the Nintendo 3DS.
 
 <p>
-  <img src="captures/screenshot_1.png" width="300">
-  <img src="captures/screenshot_2.png" width="300">
+  <img src="captures/demo.gif" width="400">
 </p>
+
+<sub>Demo recorded in the Azahar emulator; tested on real Old 3DS :3</sub>
 
 ## Features
 
 - Works on Old 3DS
 - Touch and button controls
+- Spectrum and mirror visualizers
+- Four color themes: YoRHA, Dark, Green and Purple
+- Battery indicator
+- Remembers your theme and visualizer settings
 
 | Input | Action |
 |---|---|
 | Touch a song | Play it |
 | Drag the list | Scroll |
 | Drag the progress bar | Jump to that point in the song |
-| Touch buttons | Previous / play-pause / next |
+| Touch buttons | Visualizer on / off, previous / play-pause / next, switch theme |
 | A | Play/pause or play the highlighted song |
 | D-pad up/down | Move through the list |
 | L / R | Previous / next song |
 | Y / X | Back / forward 10 seconds |
+| B | Turn the visualizer on / off |
+| SELECT | Switch visualizer mode (spectrum / mirror) |
 | START | Quit |
 
 ## Installation
