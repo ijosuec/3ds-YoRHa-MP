@@ -33,6 +33,9 @@ NieR:Automata-styled MP3 player for the Nintendo 3DS.
 
 ## Installation
 
+- **QR (CIA):** in FBI, go to Remote Install → Scan QR Code.
+
+  <img src="captures/qr.png" width="150">
 - **CIA:** install `YoRHA-3ds-MP.cia` with FBI.
 - **3DSX:** copy `YoRHA-3ds-MP.3dsx` to `sdmc:/3ds/` and open it from the Homebrew Launcher.
 
