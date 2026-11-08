@@ -175,7 +175,39 @@ bool art_upload(AlbumArt *art, const ArtPixels *px)
     return true;
 }
 
-bool art_load_background(AlbumArt *art, const uint8_t *data, size_t size)
+static int luma(const u8 *p)
+{
+    return (p[0] * 77 + p[1] * 150 + p[2] * 29) >> 8;
+}
+
+static void remap_pixels(u8 *px, int count, const BgRemap *remap)
+{
+    static int hist[256];
+    memset(hist, 0, sizeof(hist));
+    int lo = 255;
+    for (int i = 0; i < count; i++) {
+        int l = luma(px + i * 3);
+        hist[l]++;
+        if (l < lo)
+            lo = l;
+    }
+    int base = 0;
+    for (int l = 1; l < 256; l++)
+        if (hist[l] > hist[base])
+            base = l;
+    int range = base > lo ? base - lo : 1;
+
+    for (int i = 0; i < count; i++) {
+        u8 *p = px + i * 3;
+        int t = (base - luma(p)) * 256 / range;
+        if (t < 0)
+            t = 0;
+        for (int c = 0; c < 3; c++)
+            p[c] = remap->paper[c] + ((remap->ink[c] - remap->paper[c]) * t >> 8);
+    }
+}
+
+bool art_load_background(AlbumArt *art, const uint8_t *data, size_t size, const BgRemap *remap)
 {
     memset(art, 0, sizeof(*art));
 
@@ -183,6 +215,8 @@ bool art_load_background(AlbumArt *art, const uint8_t *data, size_t size)
     u8 *px = stbi_load_from_memory(data, size, &w, &h, &comp, 3);
     if (!px)
         return false;
+    if (remap)
+        remap_pixels(px, w * h, remap);
 
     u32 tw = next_pow2(w), th = next_pow2(h);
     if (tw > 1024 || th > 1024 || !C3D_TexInit(&art->tex, tw, th, GPU_RGBA8)) {

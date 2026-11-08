@@ -13,6 +13,11 @@ typedef struct {
 } AlbumArt;
 
 typedef struct {
+    u8 paper[3];
+    u8 ink[3];
+} BgRemap;
+
+typedef struct {
     u32 *pixels;
     u32 tex_size;
     u32 width, height;
@@ -23,6 +28,6 @@ void art_pixels_free(ArtPixels *px);
 
 bool art_upload(AlbumArt *art, const ArtPixels *px);
 
-bool art_load_background(AlbumArt *art, const uint8_t *data, size_t size);
+bool art_load_background(AlbumArt *art, const uint8_t *data, size_t size, const BgRemap *remap);
 
 void art_free(AlbumArt *art);

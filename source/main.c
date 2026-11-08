@@ -6,8 +6,11 @@
 
 #include "art.h"
 #include "audio.h"
+#include "battery.h"
 #include "library.h"
 #include "loader.h"
+#include "settings.h"
+#include "visualizer.h"
 
 #include "bg_top_png.h"
 #include "bg_bottom_png.h"
@@ -39,12 +42,14 @@
 #define SEEK_X0     56
 #define SEEK_X1     (BOTTOM_W - 56)
 
-#define BTN_COUNT   3
+#define BTN_COUNT   5
 #define BTN_Y       188
 #define BTN_H       24
-#define BTN_W       88
+#define BTN_W       70
+#define BTN_SMALL_W 24
 #define BTN_GAP     10
-#define BTN_X0      ((BOTTOM_W - (BTN_COUNT * BTN_W + (BTN_COUNT - 1) * BTN_GAP)) / 2)
+#define BTN_ROW_W   (3 * BTN_W + 2 * BTN_SMALL_W + 4 * BTN_GAP)
+#define BTN_X0      ((BOTTOM_W - BTN_ROW_W) / 2)
 
 #define DRAG_THRESHOLD 6
 
@@ -63,7 +68,23 @@
 #define TYPE_CHAR_FRAMES    2
 #define TYPE_STAGGER        8
 
-enum { BTN_PREV, BTN_PLAY, BTN_NEXT };
+#define BATTERY_POLL_FRAMES 120
+#define BATTERY_SEGS        4
+#define BATTERY_W           22
+#define BATTERY_H           10
+#define BATTERY_LOW         15
+
+#define VIZ_SEGS    16
+#define VIZ_SEG_H   4
+#define VIZ_SEG_GAP 1
+#define VIZ_BAR_GAP 3
+#define VIZ_BOTTOM  (ART_Y + ART_SIZE)
+#define VIZ_BAR_W   ((FIELD_W - (VIZ_BARS - 1) * VIZ_BAR_GAP) / (float)VIZ_BARS)
+#define VIZ_PITCH   (VIZ_SEG_H + VIZ_SEG_GAP)
+#define VIZ_TOP     (VIZ_BOTTOM - VIZ_SEGS * VIZ_PITCH + VIZ_SEG_GAP)
+#define VIZ_MID     ((VIZ_TOP + VIZ_BOTTOM) / 2)
+
+enum { BTN_VIZ, BTN_PREV, BTN_PLAY, BTN_NEXT, BTN_THEME };
 enum { TOUCH_NONE, TOUCH_SEEK, TOUCH_LIST, TOUCH_BUTTON };
 
 static C2D_TextBuf info_buf;
@@ -93,6 +114,11 @@ static s64 glitch_frame = -GLITCH_FRAMES;
 static s64 type_frame = -1000;
 static char cur_title[256], cur_artist[256], cur_album[256];
 static C3D_Mtx unfold_mtx;
+static bool viz_on;
+static int viz_mode;
+static s64 mode_frame;
+static int battery_pct = -1;
+static bool battery_charging;
 
 static float anim_t(s64 start, int delay, int dur)
 {
@@ -365,11 +391,11 @@ static void draw_header(const char *caption, float x, float y, float w)
     C2D_DrawRectSolid(x, y + 16, 0.5f, w, 1, clr_dim);
 }
 
-static bool begin_unfold(float x, float cy, float w, int order)
+static bool begin_unfold_at(s64 start, float x, float cy, float w, int order)
 {
     int delay = order * INTRO_STAGGER;
-    float line = anim_t(0, delay, INTRO_LINE_FRAMES);
-    float open = anim_t(0, delay + INTRO_LINE_FRAMES, INTRO_OPEN_FRAMES);
+    float line = anim_t(start, delay, INTRO_LINE_FRAMES);
+    float open = anim_t(start, delay + INTRO_LINE_FRAMES, INTRO_OPEN_FRAMES);
 
     if (open < 1.0f && line > 0.0f) {
         float lw = w * ease_out(line);
@@ -385,6 +411,11 @@ static bool begin_unfold(float x, float cy, float w, int order)
         C2D_ViewTranslate(0, -cy);
     }
     return true;
+}
+
+static bool begin_unfold(float x, float cy, float w, int order)
+{
+    return begin_unfold_at(0, x, cy, w, order);
 }
 
 static void end_unfold(void)
@@ -474,6 +505,147 @@ static void draw_error_screen(const char *title, const char *line1, const char *
     }
 }
 
+static int seg_count(float v, int segs)
+{
+    int n = (int)(v * segs + 0.5f);
+    return n > segs ? segs : n;
+}
+
+static int peak_index(float v, int segs)
+{
+    int n = (int)(v * segs);
+    return n > segs - 1 ? segs - 1 : n;
+}
+
+static u32 seg_color(int s, int lit, int top, bool base)
+{
+    if (s < lit)
+        return clr_text;
+    if ((s == top && top > 0) || (base && s == 0))
+        return clr_dim;
+    return with_alpha(clr_faint, 0.6f);
+}
+
+static void draw_spectrum(void)
+{
+    for (int b = 0; b < VIZ_BARS; b++) {
+        float x = FIELD_X + b * (VIZ_BAR_W + VIZ_BAR_GAP);
+        int lit = seg_count(viz_level(b), VIZ_SEGS);
+        int top = peak_index(viz_peak(b), VIZ_SEGS);
+        for (int s = 0; s < VIZ_SEGS; s++) {
+            float y = VIZ_BOTTOM - (s + 1) * VIZ_PITCH + VIZ_SEG_GAP;
+            C2D_DrawRectSolid(x, y, 0.5f, VIZ_BAR_W, VIZ_SEG_H, seg_color(s, lit, top, true));
+        }
+    }
+}
+
+static void draw_mirror(void)
+{
+    int half = VIZ_SEGS / 2;
+    for (int b = 0; b < VIZ_BARS; b++) {
+        float x = FIELD_X + b * (VIZ_BAR_W + VIZ_BAR_GAP);
+        int lit = seg_count(viz_level(b), half);
+        int top = peak_index(viz_peak(b), half);
+        for (int s = 0; s < half; s++) {
+            u32 c = seg_color(s, lit, top, true);
+            float up = VIZ_MID - 1 - (s + 1) * VIZ_PITCH + VIZ_SEG_GAP;
+            float down = VIZ_MID + 1 + s * VIZ_PITCH;
+            C2D_DrawRectSolid(x, up, 0.5f, VIZ_BAR_W, VIZ_SEG_H, c);
+            C2D_DrawRectSolid(x, down, 0.5f, VIZ_BAR_W, VIZ_SEG_H, c);
+        }
+    }
+}
+
+typedef struct {
+    const char *name;
+    void (*draw)(void);
+} VizMode;
+
+static const VizMode viz_modes[] = {
+    { "SPECTRUM", draw_spectrum },
+    { "MIRROR", draw_mirror },
+};
+
+#define VIZ_MODES ((int)(sizeof(viz_modes) / sizeof(viz_modes[0])))
+
+static void viz_switch(void)
+{
+    mode_frame = frame_count - 2 * INTRO_STAGGER;
+    glitch_frame = frame_count;
+    type_frame = frame_count;
+}
+
+static void update_battery(void)
+{
+    if (frame_count % BATTERY_POLL_FRAMES != 0)
+        return;
+    int pct;
+    bool charging;
+    if (battery_read(&pct, &charging)) {
+        battery_pct = pct;
+        battery_charging = charging;
+    }
+}
+
+static void draw_battery(float right, float y)
+{
+    if (battery_pct < 0)
+        return;
+
+    float x = right - BATTERY_W - 2;
+    bool low = battery_pct <= BATTERY_LOW && !battery_charging;
+    u32 c = low ? clr_error : clr_dim;
+
+    draw_frame(x, y, BATTERY_W, BATTERY_H, c);
+    C2D_DrawRectSolid(x + BATTERY_W, y + 3, 0.5f, 2, BATTERY_H - 6, c);
+
+    int lit = (battery_pct + 24) / 25;
+    if (battery_charging) {
+        int step = (frame_count / 20) % (BATTERY_SEGS + 1);
+        if (step > lit)
+            lit = step;
+    }
+    float inner = BATTERY_W - 4;
+    float seg_w = (inner - (BATTERY_SEGS - 1)) / BATTERY_SEGS;
+    for (int i = 0; i < lit && i < BATTERY_SEGS; i++)
+        C2D_DrawRectSolid(x + 2 + i * (seg_w + 1), y + 2, 0.5f, seg_w, BATTERY_H - 4, c);
+
+    char label[8];
+    snprintf(label, sizeof(label), "%d%%", battery_pct);
+    draw_text(label, x - 4, y - 2, 0.4f, c, 40, C2D_AlignRight);
+}
+
+static void draw_viz_fields(float y)
+{
+    const VizMode *m = &viz_modes[viz_mode];
+    if (draw_typed(m->name, FIELD_X, y, 0.4f, clr_dim, FIELD_W, type_frame + TYPE_STAGGER))
+        draw_string(m->name, FIELD_X, y, 0.4f, clr_dim, FIELD_W);
+    m->draw();
+}
+
+static void draw_track_fields(float y)
+{
+    draw_string("ARTIST", FIELD_X, y, 0.4f, clr_dim, FIELD_W);
+    if (draw_typed(cur_artist, FIELD_X, y + 11, 0.55f, clr_text, FIELD_W, type_frame + TYPE_STAGGER))
+        C2D_DrawText(&artist_text, C2D_WithColor, FIELD_X, y + 11, 0.5f, 0.55f, 0.55f, clr_text);
+    y += FIELD_STEP;
+    draw_string("ALBUM", FIELD_X, y, 0.4f, clr_dim, FIELD_W);
+    if (draw_typed(cur_album, FIELD_X, y + 11, 0.55f, clr_text, FIELD_W, type_frame + 2 * TYPE_STAGGER))
+        C2D_DrawText(&album_text, C2D_WithColor, FIELD_X, y + 11, 0.5f, 0.55f, 0.55f, clr_text);
+    y += FIELD_STEP;
+
+    char line[64];
+    snprintf(line, sizeof(line), "TRACK %03d / %03d", current + 1, lib.count);
+    if (draw_typed(line, FIELD_X, y + 4, 0.45f, clr_text, FIELD_W, type_frame + 3 * TYPE_STAGGER))
+        draw_string(line, FIELD_X, y + 4, 0.45f, clr_text, FIELD_W);
+
+    const char *state = !play_ok ? "UNPLAYABLE FILE" : audio_is_paused() ? "PAUSED" : "PLAYING";
+    float tag_w = 108;
+    C2D_DrawRectSolid(FIELD_X, y + 22, 0.5f, tag_w, 15, play_ok ? clr_text : clr_error);
+    if (draw_typed(state, FIELD_X + 6, y + 23, 0.42f, clr_bg, tag_w - 12, type_frame + 4 * TYPE_STAGGER))
+        draw_text(state, FIELD_X + tag_w / 2, y + 23, 0.42f, clr_bg, tag_w - 4, C2D_AlignCenter);
+}
+
 static void draw_top(C3D_RenderTarget *target)
 {
     C2D_TargetClear(target, clr_bg);
@@ -494,6 +666,9 @@ static void draw_top(C3D_RenderTarget *target)
     if (begin_unfold(MARGIN, 26, TOP_W - 2 * MARGIN, 0)) {
         draw_header("PLAYBACK", MARGIN, 18, TOP_W - 2 * MARGIN);
         draw_text("v" APP_VERSION, TOP_W - MARGIN - 13, 19, 0.4f, clr_dim, 60, C2D_AlignRight);
+        float ver_w;
+        C2D_TextGetDimensions(cached_text("v" APP_VERSION, 0.4f, 60), 0.4f, 0.4f, &ver_w, NULL);
+        draw_battery(TOP_W - MARGIN - 13 - ver_w - 10, 21);
         if ((frame_count / 40) % 2 == 0)
             C2D_DrawRectSolid(TOP_W - MARGIN - 7, 21, 0.5f, 7, 7, clr_dim);
         end_unfold();
@@ -513,35 +688,33 @@ static void draw_top(C3D_RenderTarget *target)
         end_unfold();
     }
 
-    if (begin_unfold(FIELD_X, ART_Y + ART_SIZE / 2, FIELD_W, 2)) {
+    if (begin_unfold_at(mode_frame, FIELD_X, ART_Y + ART_SIZE / 2, FIELD_W, 2)) {
         float y = ART_Y - 2;
         draw_string("TITLE", FIELD_X, y, 0.4f, clr_dim, FIELD_W);
         if (draw_typed(cur_title, FIELD_X, y + 11, 0.6f, clr_text, FIELD_W, type_frame))
             C2D_DrawText(&title_text, C2D_WithColor, FIELD_X, y + 11, 0.5f, 0.6f, 0.6f, clr_text);
         y += FIELD_STEP;
-        draw_string("ARTIST", FIELD_X, y, 0.4f, clr_dim, FIELD_W);
-        if (draw_typed(cur_artist, FIELD_X, y + 11, 0.55f, clr_text, FIELD_W, type_frame + TYPE_STAGGER))
-            C2D_DrawText(&artist_text, C2D_WithColor, FIELD_X, y + 11, 0.5f, 0.55f, 0.55f, clr_text);
-        y += FIELD_STEP;
-        draw_string("ALBUM", FIELD_X, y, 0.4f, clr_dim, FIELD_W);
-        if (draw_typed(cur_album, FIELD_X, y + 11, 0.55f, clr_text, FIELD_W, type_frame + 2 * TYPE_STAGGER))
-            C2D_DrawText(&album_text, C2D_WithColor, FIELD_X, y + 11, 0.5f, 0.55f, 0.55f, clr_text);
-        y += FIELD_STEP;
-
-        char line[64];
-        snprintf(line, sizeof(line), "TRACK %03d / %03d", current + 1, lib.count);
-        if (draw_typed(line, FIELD_X, y + 4, 0.45f, clr_text, FIELD_W, type_frame + 3 * TYPE_STAGGER))
-            draw_string(line, FIELD_X, y + 4, 0.45f, clr_text, FIELD_W);
-
-        const char *state = !play_ok ? "UNPLAYABLE FILE" : audio_is_paused() ? "PAUSED" : "PLAYING";
-        float tag_w = 108;
-        C2D_DrawRectSolid(FIELD_X, y + 22, 0.5f, tag_w, 15, play_ok ? clr_text : clr_error);
-        if (draw_typed(state, FIELD_X + 6, y + 23, 0.42f, clr_bg, tag_w - 12, type_frame + 4 * TYPE_STAGGER))
-            draw_text(state, FIELD_X + tag_w / 2, y + 23, 0.42f, clr_bg, tag_w - 4, C2D_AlignCenter);
+        if (viz_on)
+            draw_viz_fields(y);
+        else
+            draw_track_fields(y);
         end_unfold();
     }
 
     draw_glitch_bands(TOP_W, 0x1234);
+}
+
+static int button_w(int i)
+{
+    return i == BTN_VIZ || i == BTN_THEME ? BTN_SMALL_W : BTN_W;
+}
+
+static int button_x(int i)
+{
+    int x = BTN_X0;
+    for (int j = 0; j < i; j++)
+        x += button_w(j) + BTN_GAP;
+    return x;
 }
 
 static int button_at(int px, int py)
@@ -549,8 +722,8 @@ static int button_at(int px, int py)
     if (py < BTN_Y || py >= BTN_Y + BTN_H)
         return -1;
     for (int i = 0; i < BTN_COUNT; i++) {
-        int x = BTN_X0 + i * (BTN_W + BTN_GAP);
-        if (px >= x && px < x + BTN_W)
+        int x = button_x(i);
+        if (px >= x && px < x + button_w(i))
             return i;
     }
     return -1;
@@ -576,6 +749,17 @@ static void draw_button_icon(int id, float cx, float cy, u32 c)
         } else {
             draw_tri(cx - 5, cy - 7, cx - 5, cy + 7, cx + 7, cy, c);
         }
+        break;
+    case BTN_VIZ:
+        for (int b = 0; b < 3; b++) {
+            static const int heights[3] = { 2, 4, 3 };
+            for (int s = 0; s < heights[b]; s++)
+                C2D_DrawRectSolid(cx - 6 + b * 5, cy + 5 - s * 3 - 2, 0.5f, 3, 2, c);
+        }
+        break;
+    case BTN_THEME:
+        draw_frame(cx - 6, cy - 6, 12, 12, c);
+        C2D_DrawRectSolid(cx - 6, cy - 6, 0.5f, 6, 12, c);
         break;
     }
 }
@@ -646,26 +830,130 @@ static void draw_bottom(C3D_RenderTarget *target)
         end_unfold();
     }
 
-    if (begin_unfold(BTN_X0, BTN_Y + BTN_H / 2, BTN_COUNT * BTN_W + (BTN_COUNT - 1) * BTN_GAP, 3)) {
+    if (begin_unfold(BTN_X0, BTN_Y + BTN_H / 2, BTN_ROW_W, 3)) {
         for (int i = 0; i < BTN_COUNT; i++) {
-            float x = BTN_X0 + i * (BTN_W + BTN_GAP);
+            float x = button_x(i);
+            float w = button_w(i);
             bool pressed = touch.mode == TOUCH_BUTTON && touch.button == i &&
                            button_at(touch.last.px, touch.last.py) == i;
-            u32 fg = pressed ? clr_bg : clr_text;
+            u32 fg = pressed ? clr_bg : i == BTN_VIZ && !viz_on ? clr_dim : clr_text;
 
             if (pressed) {
-                C2D_DrawRectSolid(x + 2, BTN_Y + 2, 0.5f, BTN_W, BTN_H, clr_text);
+                C2D_DrawRectSolid(x + 2, BTN_Y + 2, 0.5f, w, BTN_H, clr_text);
             } else {
-                draw_panel(x, BTN_Y, BTN_W, BTN_H, clr_panel);
-                draw_frame(x, BTN_Y, BTN_W, BTN_H, clr_dim);
+                draw_panel(x, BTN_Y, w, BTN_H, clr_panel);
+                draw_frame(x, BTN_Y, w, BTN_H, i == BTN_VIZ && viz_on ? clr_text : clr_dim);
             }
             float off = pressed ? 2 : 0;
-            draw_button_icon(i, x + off + BTN_W / 2.0f, BTN_Y + off + BTN_H / 2.0f, fg);
+            draw_button_icon(i, x + off + w / 2.0f, BTN_Y + off + BTN_H / 2.0f, fg);
         }
         end_unfold();
     }
 
     draw_glitch_bands(BOTTOM_W, 0x5678);
+}
+
+typedef struct {
+    u32 bg, text, dim, faint, panel, shadow, error;
+    bool recolor;
+} Theme;
+
+static const Theme themes[] = {
+    {
+        .bg = 0xd5d1bcff, .text = 0x4e4b42ff, .dim = 0x8a8676ff, .faint = 0xb4af9aff,
+        .panel = 0xcdc8b0e0, .shadow = 0x4e4b4240, .error = 0x9c453aff,
+    },
+    {
+        .bg = 0x161614ff, .text = 0xe6e2d4ff, .dim = 0x8f8b7eff, .faint = 0x45433dff,
+        .panel = 0x22221fe0, .shadow = 0x00000080, .error = 0xe05a3cff,
+        .recolor = true,
+    },
+    {
+        .bg = 0x232820ff, .text = 0xc6ec70ff, .dim = 0x8faa61ff, .faint = 0x464d38ff,
+        .panel = 0x2d3427e0, .shadow = 0x00000080, .error = 0xe8a33cff,
+        .recolor = true,
+    },
+    {
+        .bg = 0x1e1629ff, .text = 0xd9c2f0ff, .dim = 0x9b7fbfff, .faint = 0x4a3863ff,
+        .panel = 0x2a1f3ae0, .shadow = 0x00000080, .error = 0xff7aa8ff,
+        .recolor = true,
+    },
+};
+
+#define THEME_COUNT ((int)(sizeof(themes) / sizeof(themes[0])))
+
+static int theme;
+
+static u32 hex_color(u32 rgba)
+{
+    return C2D_Color32(rgba >> 24, (rgba >> 16) & 0xff, (rgba >> 8) & 0xff, rgba & 0xff);
+}
+
+static void to_rgb(u8 *out, u32 rgba)
+{
+    out[0] = rgba >> 24;
+    out[1] = rgba >> 16;
+    out[2] = rgba >> 8;
+}
+
+static void apply_theme(int index)
+{
+    theme = index;
+    const Theme *t = &themes[index];
+    clr_bg = hex_color(t->bg);
+    clr_text = hex_color(t->text);
+    clr_dim = hex_color(t->dim);
+    clr_faint = hex_color(t->faint);
+    clr_panel = hex_color(t->panel);
+    clr_shadow = hex_color(t->shadow);
+    clr_error = hex_color(t->error);
+
+    BgRemap remap;
+    to_rgb(remap.paper, t->bg);
+    to_rgb(remap.ink, t->text);
+    const BgRemap *r = t->recolor ? &remap : NULL;
+    art_free(&bg_top);
+    art_free(&bg_bottom);
+    art_load_background(&bg_top, bg_top_png, bg_top_png_size, r);
+    art_load_background(&bg_bottom, bg_bottom_png, bg_bottom_png_size, r);
+}
+
+static void save_settings(void)
+{
+    Settings s = { .theme = theme, .viz_on = viz_on, .viz_mode = viz_mode };
+    settings_save(&s);
+}
+
+static void load_settings(void)
+{
+    Settings s = { 0 };
+    settings_load(&s);
+    apply_theme(s.theme >= 0 && s.theme < THEME_COUNT ? s.theme : 0);
+    viz_mode = s.viz_mode >= 0 && s.viz_mode < VIZ_MODES ? s.viz_mode : 0;
+    viz_on = s.viz_on;
+}
+
+static void toggle_viz(void)
+{
+    viz_on = !viz_on;
+    viz_switch();
+    save_settings();
+}
+
+static void next_viz_mode(void)
+{
+    if (viz_on)
+        viz_mode = (viz_mode + 1) % VIZ_MODES;
+    viz_on = true;
+    viz_switch();
+    save_settings();
+}
+
+static void next_theme(void)
+{
+    apply_theme((theme + 1) % THEME_COUNT);
+    glitch_frame = frame_count;
+    save_settings();
 }
 
 static void touch_begin(touchPosition p)
@@ -724,6 +1012,8 @@ static void touch_end(void)
         case BTN_PREV: action_prev(); break;
         case BTN_PLAY: if (play_ok) audio_toggle_pause(); else pending = current; break;
         case BTN_NEXT: action_next(); break;
+        case BTN_VIZ: toggle_viz(); break;
+        case BTN_THEME: next_theme(); break;
         }
         break;
     }
@@ -744,16 +1034,8 @@ int main(void)
     info_buf = C2D_TextBufNew(1024);
     scratch_buf = C2D_TextBufNew(512);
 
-    art_load_background(&bg_top, bg_top_png, bg_top_png_size);
-    art_load_background(&bg_bottom, bg_bottom_png, bg_bottom_png_size);
-
-    clr_bg = C2D_Color32(0xd5, 0xd1, 0xbc, 0xff);
-    clr_text = C2D_Color32(0x4e, 0x4b, 0x42, 0xff);
-    clr_dim = C2D_Color32(0x8a, 0x86, 0x76, 0xff);
-    clr_faint = C2D_Color32(0xb4, 0xaf, 0x9a, 0xff);
-    clr_panel = C2D_Color32(0xcd, 0xc8, 0xb0, 0xe0);
-    clr_shadow = C2D_Color32(0x4e, 0x4b, 0x42, 0x40);
-    clr_error = C2D_Color32(0x9c, 0x45, 0x3a, 0xff);
+    load_settings();
+    battery_init();
 
     hidSetRepeatParameters(15, 4);
 
@@ -783,6 +1065,10 @@ int main(void)
                 action_skip(-SKIP_SECONDS);
             if (down & KEY_X)
                 action_skip(SKIP_SECONDS);
+            if (down & KEY_B)
+                toggle_viz();
+            if (down & KEY_SELECT)
+                next_viz_mode();
 
             if (repeat & KEY_DUP) {
                 cursor = (cursor - 1 + lib.count) % lib.count;
@@ -825,6 +1111,9 @@ int main(void)
             start_paused = false;
         }
         receive_track_info();
+        update_battery();
+        if (viz_on)
+            viz_update();
 
         draw_top(top);
         draw_bottom(bottom);
@@ -833,6 +1122,7 @@ int main(void)
     }
 
     loader_exit();
+    battery_exit();
     if (audio_ok)
         audio_exit();
     art_free(&art);

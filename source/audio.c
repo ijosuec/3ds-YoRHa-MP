@@ -273,3 +273,43 @@ float audio_duration(void)
     return len;
 }
 
+u32 audio_sample_rate(void)
+{
+    return sample_rate;
+}
+
+int audio_get_samples(float *out, int n)
+{
+    if (paused)
+        return 0;
+
+    LightLock_Lock(&lock);
+    ndspWaveBuf *wb = NULL;
+    for (int i = 0; i < NUM_BUFS; i++)
+        if (wavebufs[i].status == NDSP_WBUF_PLAYING)
+            wb = &wavebufs[i];
+
+    int got = 0;
+    if (loaded && wb && wb->nsamples > 0) {
+        int avail = wb->nsamples;
+        if (n > avail)
+            n = avail;
+        int start = ndspChnGetSamplePos(CHANNEL);
+        if (start > avail - n)
+            start = avail - n;
+        if (start < 0)
+            start = 0;
+
+        const s16 *src = wb->data_pcm16 + start * channels;
+        if (channels == 2) {
+            for (int i = 0; i < n; i++)
+                out[i] = (src[2 * i] + src[2 * i + 1]) * (0.5f / 32768.0f);
+        } else {
+            for (int i = 0; i < n; i++)
+                out[i] = src[i] * (1.0f / 32768.0f);
+        }
+        got = n;
+    }
+    LightLock_Unlock(&lock);
+    return got;
+}

@@ -16,12 +16,12 @@ SOURCES		:=	source
 INCLUDES	:=	include lib
 DATA		:=	data
 
-APP_TITLE	:=	Music Player
-APP_DESCRIPTION	:=	YoRHA-3ds-MP
-APP_AUTHOR	:=	YoRHa No.001 Type M
+APP_TITLE	:=	YoRHA-3ds-MP
+APP_DESCRIPTION	:=	NieR:Automata-styled MP3 player
+APP_AUTHOR	:=	YoRHA No.001 Type iJ
 APP_PRODUCT_CODE	:=	CTR-H-MUSP
 APP_UNIQUE_ID	:=	0xF5A4E
-APP_VERSION	:=	1.0.0
+APP_VERSION	:=	1.1.0
 
 ICON		:=	resources/icon.png
 BANNER_IMAGE	:=	resources/banner.png

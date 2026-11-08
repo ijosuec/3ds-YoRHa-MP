@@ -17,3 +17,7 @@ bool audio_is_finished(void);
 float audio_position(void);
 
 float audio_duration(void);
+
+u32 audio_sample_rate(void);
+
+int audio_get_samples(float *out, int n);

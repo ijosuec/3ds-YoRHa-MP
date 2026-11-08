@@ -187,6 +187,7 @@ AccessControlInfo:
     - nwm::UDS
     - ptm:sysm
     - ptm:u
+    - mcu::HWC
     - pxi:dev
     - soc:U
     - ssl:C
